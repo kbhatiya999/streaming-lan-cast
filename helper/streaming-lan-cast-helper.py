@@ -951,6 +951,26 @@ def lan_ip(target):
 
 
 # --- UPnP AVTransport SOAP and DIDL control ----------------------------------
+def _dlna_control_for(tv, given=""):
+    """The AVTransport control url of the renderer at tv: the one discovery read off its description
+    when the device was listed, else the one an SSDP search turns up for that host now, else the
+    description at the port and path Samsung's Tizen sets serve it on. '' when nothing answers. A
+    url handed in is taken only when it names that same host."""
+    if given and urllib.parse.urlparse(given).hostname == tv:
+        return given
+    try:
+        for d in discover_dlna_renderers(timeout=2.5):
+            if d.get("host") == tv and d.get("control_url"):
+                return d["control_url"]
+    except Exception as e:
+        log(f"dlna: discovery failed ({type(e).__name__})")
+    try:
+        return discover_control_url(tv, DMR_PORT)
+    except (Exception, SystemExit) as e:
+        log(f"dlna: no device description at {tv}:{DMR_PORT}/dmr ({type(e).__name__})")
+    return ""
+
+
 def discover_control_url(tv, port):
     base = f"http://{tv}:{port}/dmr"
     with urllib.request.urlopen(base, timeout=5) as r:
@@ -2694,6 +2714,8 @@ def serve_control(port):
                 extra += ["--cast-name", cast["name"]]
             if cast.get("model"):
                 extra += ["--cast-model", cast["model"]]
+        if kind == "dlna" and cast and cast.get("control_url"):
+            extra += ["--dlna-control", cast["control_url"]]
         return extra
 
     def launch(extra, headers=None):
@@ -2975,6 +2997,10 @@ def serve_control(port):
             if kind == "cast":
                 cinfo = {"port": (dev or {}).get("port", 8009), "uuid": (dev or {}).get("uuid", ""),
                          "name": (dev or {}).get("name", name), "model": (dev or {}).get("model", "")}
+            elif kind == "dlna":
+                # the control url discovery read off the renderer's own description. Sets serve that
+                # description at different paths, so the proxy gets the url passed in directly
+                cinfo = {"control_url": (dev or {}).get("control_url", ""), "name": (dev or {}).get("name", name)}
             # Sniffed sibling playlists ride along as fallbacks: a host that mints per-request
             # signatures can kill the chosen url between the classify fetch and the proxy's own,
             # while the stream the page itself is playing provably serves.
@@ -3270,6 +3296,8 @@ def serve_control(port):
                         argv += ["--cast-name", cinfo["name"]]
                     if cinfo.get("model"):
                         argv += ["--cast-model", cinfo["model"]]
+                if kind == "dlna" and cinfo.get("control_url"):
+                    argv += ["--dlna-control", cinfo["control_url"]]
                 if pid is not None:
                     argv += ["--kill-pid", str(pid)]
                 launch(argv)
@@ -3392,7 +3420,7 @@ def run_stop(args):
     # if our proxy is still the live one (a quick re-cast may have replaced it).
     if (not args.cast) and ((not managed) or (target and _pid_is_proxy(target))):
         try:
-            soap(discover_control_url(args.tv, DMR_PORT), "Stop", "<InstanceID>0</InstanceID>")
+            soap(_dlna_control_for(args.tv, getattr(args, "dlna_control", "")), "Stop", "<InstanceID>0</InstanceID>")
         except Exception:
             pass   # TV unreachable/off -> still tear the proxy down below
         time.sleep(0.4)
@@ -6381,7 +6409,19 @@ def run_cast(args):
     os._exit(0)
 
 def run_proxy(args):
-    control_url = discover_control_url(args.tv, DMR_PORT)
+    control_url = _dlna_control_for(args.tv, getattr(args, "dlna_control", ""))
+    if not control_url:
+        # Nothing to drive: the set is off, on another network, or serves its description somewhere
+        # discovery did not find. The cast ends here with an error the popup picks up.
+        log(f"dlna: {args.tv} serves no device description discovery can reach; is the TV on and on this network?")
+        try:
+            with open(PROXY_ERR_FILE, "w", encoding="utf-8") as _ef:
+                json.dump({"code": 503, "ts": time.time()}, _ef)
+        except OSError:
+            pass
+        _safe_unlink(PIDFILE)
+        clear_cast_state()
+        os._exit(1)
     log(f"TV AVTransport: {control_url}")
 
     if not args.managed:
@@ -6478,6 +6518,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("url", nargs="?", default=DEFAULT_URL, help="stream page URL (any site streamlink supports)")
     ap.add_argument("--tv", default=DEFAULT_TV, help="DLNA renderer IP (the extension sets this per device)")
+    ap.add_argument("--dlna-control", default="", help=argparse.SUPPRESS)   # the renderer's AVTransport control url, as discovered
     ap.add_argument("--quality", default="best", help="streamlink quality (best, 720p60, ...)")
     ap.add_argument("--proxy", action="store_true", help="serve as MPEG-TS via our live HTTP server")
     ap.add_argument("--port", type=int, default=8088, help="local proxy port")
