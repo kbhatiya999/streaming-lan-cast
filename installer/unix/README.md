@@ -129,6 +129,15 @@ launchctl unload "$PLIST"                               # stop it
 Casting diagnostics are logged to `streaming-lan-cast.log` in your temp dir (`/tmp` on Linux,
 `$TMPDIR` on macOS).
 
+**macOS and the Local Network permission.** The helper finds your devices with multicast queries on
+the LAN, and macOS only lets an app do that once you allow it under System Settings → Privacy &
+Security → Local Network. macOS asks the first time the helper scans; the entry it creates belongs
+to the Python binary the venv was built from. A Homebrew upgrade of Python installs a new binary,
+and the old permission no longer covers it, so the popup finds no devices and the log says
+`discover: nothing answered, and the LAN sockets failed with EHOSTUNREACH`. Allow the new Python
+there (or rebuild the venv with `./installer/unix/install.sh` after the upgrade, which prompts again).
+A python.org build of Python keeps its identity across updates, so the permission carries over.
+
 ---
 
 ## Updating
@@ -167,6 +176,7 @@ Remove the extension from your browser separately (Firefox: `about:addons`; Chro
 
 | Symptom | Fix |
 |---|---|
+| **Devices never appear (macOS)** | The Local Network permission: see the macOS note under Managing the helper. The log names the socket error. |
 | **"Helper not detected"** | Linux: `systemctl --user status streaming-lan-cast.service` (start it with `... start ...`). macOS: `launchctl list \| grep streaming-lan-cast`. If you reinstalled, re-paste the token. |
 | **Install stops: "python3 not found"** | Linux: install `python3` (and `python3-venv`) from your package manager. macOS: `brew install python` or `xcode-select --install`. |
 | **Install stops: "Python 3.10+ is required"** | Update Python (macOS: `brew install python`; Linux: your distro's package). |

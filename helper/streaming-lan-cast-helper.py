@@ -63,6 +63,7 @@ import tempfile
 import threading
 import time
 import atexit
+import errno as errno_mod
 import datetime
 import shutil
 import urllib.parse
@@ -495,6 +496,18 @@ def _parse_dlna_device(location):
     }
 
 
+# The last socket error a device scan hit, and where. When a scan comes back empty, the log can
+# then say the sockets failed instead of implying there are no devices. Each scan resets it.
+_DISC_ERR = {"errno": 0, "name": "", "where": "", "logged": 0.0, "last": ""}
+
+
+def _disc_note(where, exc):
+    err = getattr(exc, "errno", None)
+    if not err:
+        return
+    _DISC_ERR.update(errno=err, name=errno_mod.errorcode.get(err, str(err)), where=where)
+
+
 def _primary_multicast_ip():
     """The local IP the OS uses to reach the multicast group: the right NIC,
     found instantly without enumerating adapters."""
@@ -537,8 +550,8 @@ def _ssdp_search(src_ip, timeout):
             m = re.search(r"LOCATION:\s*(\S+)", data.decode("utf-8", "replace"), re.I)
             if m:
                 locs.add(m.group(1).strip())
-    except OSError:
-        pass
+    except OSError as e:
+        _disc_note("ssdp", e)
     finally:
         s.close()
     return locs
@@ -2339,17 +2352,22 @@ def discover_cast_devices(timeout=2.0):
         def remove_service(self, *a):
             pass
 
-    zc = Zeroconf()
     try:
-        ServiceBrowser(zc, "_googlecast._tcp.local.", _Listener())
-        time.sleep(timeout)
-    except Exception:
-        pass
-    finally:
+        zc = Zeroconf()
+    except Exception as e:
+        zc = None                      # no multicast socket on this network
+        _disc_note("mdns", e)
+    if zc is not None:
         try:
-            zc.close()
+            ServiceBrowser(zc, "_googlecast._tcp.local.", _Listener())
+            time.sleep(timeout)
         except Exception:
             pass
+        finally:
+            try:
+                zc.close()
+            except Exception:
+                pass
     return list(found.values())
 
 
@@ -2391,6 +2409,7 @@ def discover_all_devices():
     remote exit) over a plain HLS proxy; SLC_PREFER_DLNA=1 prefers the DLNA (MPEG-TS/SOAP) entry."""
     from concurrent.futures import ThreadPoolExecutor
     devs = []
+    _DISC_ERR.update(errno=0, name="", where="")
     with ThreadPoolExecutor(max_workers=2) as ex:
         futs = [ex.submit(discover_dlna_renderers), ex.submit(discover_cast_devices)]
         for f in futs:
@@ -2426,6 +2445,17 @@ def discover_all_devices():
             d["preferred"] = (kind == ("dlna" if prefer_dlna else "cast")) if len(ways) > 1 else True
             out.append(d)
     out.sort(key=lambda d: (d["name"].lower(), d.get("kind") != ("dlna" if prefer_dlna else "cast")))
+    if not out and _DISC_ERR["errno"]:
+        # An empty scan while the LAN sockets are failing points at this computer, so the log says so.
+        # Logged once per cause and again after 10 minutes, since scans repeat every few seconds.
+        _what = f"{_DISC_ERR['name']} ({_DISC_ERR['where']})"
+        if _what != _DISC_ERR["last"] or time.monotonic() - _DISC_ERR["logged"] > 600:
+            _DISC_ERR.update(last=_what, logged=time.monotonic())
+            _hint = (" On macOS this is the Local Network permission: allow the helper's Python under "
+                     "System Settings > Privacy & Security > Local Network (a Homebrew Python upgrade "
+                     "installs a new binary, which loses it)." if sys.platform == "darwin" else
+                     " A firewall or a VPN that owns the LAN route can cause it.")
+            log(f"discover: nothing answered, and the LAN sockets failed with {_what}.{_hint}")
     return out
 
 
@@ -2436,7 +2466,8 @@ def _tcp_open(host, port, timeout=4):
     try:
         with socket.create_connection((host, int(port or 8009)), timeout=timeout):
             return True
-    except OSError:
+    except OSError as e:
+        _disc_note("tcp", e)
         return False
 
 
