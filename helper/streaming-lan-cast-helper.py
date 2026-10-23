@@ -4531,7 +4531,12 @@ def _resolve_youtube(page_url, max_h=2160, itag=None, codecs="avc"):
                 sdr = 1 if (f.get("dynamic_range") or "SDR") == "SDR" else 0
                 return (f.get("height") or 0, f.get("fps") or 0, sdr, f.get("tbr") or 0)
             v_avc = max(avcs, key=_arank)
-    a = max(auds, key=lambda f: f.get("tbr") or 0)
+    # Prefer the original soundtrack. A video with dubbed tracks lists all of them; yt-dlp gives the
+    # original the highest language_preference and puts "original" in its format_note, so dubs rank lower.
+    def _audio_rank(f):
+        note = (f.get("format_note") or "").lower()
+        return (f.get("language_preference") or 0, 1 if "original" in note else 0, f.get("tbr") or 0)
+    a = max(auds, key=_audio_rank)
     ua = (v.get("http_headers") or {}).get("User-Agent") or "Mozilla/5.0"
     return {"kind": "vod", "video": v["url"], "audio": a["url"], "ua": ua, "height": v.get("height"),
             # the picked format dicts and runtime feed the on-demand DASH manifest
