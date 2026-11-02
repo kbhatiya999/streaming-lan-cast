@@ -2244,9 +2244,35 @@ def make_hls_proxy(source_url, hdr_map, tv="", media_kind="hls", quality="", fal
                             ct = "video/mp2t"
                         else:
                             ct = ct or "video/mp2t"
+                    _rng = re.match(r"bytes=(\d*)-(\d*)$", (self.headers.get("Range") or "").strip())
+                    if _rng and (_rng.group(1) or _rng.group(2)):
+                        # A renderer's player that reads a segment in byte ranges (4XVR on the Quest asks
+                        # for it 1 MiB at a time) must get just that slice, or it plays the segment's
+                        # start over and over. A segment is small, so it is read whole and sliced here.
+                        body = first + r.read()
+                        n = len(body)
+                        a, b = _rng.group(1), _rng.group(2)
+                        start, end = (int(a), min(int(b) if b else n - 1, n - 1)) if a else (max(0, n - int(b)), n - 1)
+                        if start >= n or start > end:
+                            self.send_response(416)
+                            self._cors([("Content-Range", f"bytes */{n}"), ("Content-Length", "0"),
+                                        ("Connection", "close")]); self.end_headers()
+                            return
+                        self.send_response(206)
+                        self.send_header("Content-Type", ct)
+                        self._cors([("Content-Range", f"bytes {start}-{end}/{n}"),
+                                    ("Content-Length", str(end - start + 1)), ("Accept-Ranges", "bytes"),
+                                    ("Connection", "close")]); self.end_headers()
+                        self.wfile.write(body[start:end + 1])
+                        _SEG_SERVED["at"] = time.monotonic()
+                        return
+                    _clen = r.headers.get("Content-Length")
+                    # Not when a header was stripped, nor over a compressed body (the length is the wire's).
+                    _whole = [("Content-Length", _clen)] if (_clen and ct == ctype
+                                                             and not r.headers.get("Content-Encoding")) else []
                     self.send_response(200)
                     self.send_header("Content-Type", ct)
-                    self._cors([("Connection", "close")]); self.end_headers()
+                    self._cors(_whole + [("Accept-Ranges", "bytes"), ("Connection", "close")]); self.end_headers()
                     _sent = 0
                     if first:
                         self.wfile.write(first)
