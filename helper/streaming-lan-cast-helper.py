@@ -4338,6 +4338,24 @@ def _prefer_h264_codec(url):
     return re.sub(r'([?&][^=&]*codec[^=&]*=)av1(?=&|$)', r'\g<1>h264', url, flags=re.IGNORECASE)
 
 
+def _h264_sibling(url, hdr_map):
+    """The non-AV1 rendition beside an AV1 media playlist named for its codec (1080.av1.mp4.m3u8 ->
+    1080.mp4.m3u8), or "" when there is none. Some CDNs encode both, and a master's CODECS can name
+    avc1 over AV1 segments, so the sibling is probed rather than trusted."""
+    parts = urllib.parse.urlsplit(url)
+    path = re.sub(r"\.av1(?=\.[^/]*$)", "", parts.path, flags=re.IGNORECASE)
+    if path == parts.path:
+        return ""
+    sib = urllib.parse.urlunsplit(parts._replace(path=path))
+    try:
+        with urllib.request.urlopen(urllib.request.Request(sib, headers=hdr_map), timeout=10) as r:
+            if "#EXTINF" not in r.read(65536).decode("utf-8", "replace"):
+                return ""
+    except Exception:
+        return ""
+    return "" if _hls_video_codec(sib, hdr_map) == "av1" else sib
+
+
 def _media_signature(buf):
     """Locate a media container inside buf (which may carry a wrapper header). Returns (kind, offset):
     'ts'/'fmp4' and the byte offset where it begins (0 = plain media, >0 = wrapped), or ('', -1) if
@@ -6537,8 +6555,15 @@ def run_proxy(args):
             _fbs = json.loads(args.fallback_media) if args.fallback_media else []
         except Exception:
             _fbs = []
+        _src = args.media_url
+        if _hls_video_codec(_src, hdr_map) == "av1":
+            # A renderer's own player rarely decodes AV1 (the Quest 2 has no decoder for it): take the
+            # source's H.264 rendition when it offers one.
+            _sib = _h264_sibling(_src, hdr_map)
+            log(f"dlna: AV1 source -> {'its H.264 rendition' if _sib else 'no H.264 rendition found; casting AV1'}")
+            _src = _sib or _src
         httpd = ThreadingHTTPServer((ip, args.port),
-                                    make_hls_proxy(args.media_url, hdr_map, tv=args.tv, media_kind="hls",
+                                    make_hls_proxy(_src, hdr_map, tv=args.tv, media_kind="hls",
                                                    quality="" if args.quality == "best" else args.quality,
                                                    fallbacks=_fbs))
         local_url = f"http://{ip}:{args.port}/live.m3u8?vod=1"
