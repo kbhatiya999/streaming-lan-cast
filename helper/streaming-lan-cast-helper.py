@@ -1038,11 +1038,16 @@ def didl(stream_url, title):
     return _didl(stream_url, title, cls, proto)
 
 
-def set_and_play(control_url, url, title):
+def didl_hls(playlist_url, title):
+    # An on-demand HLS playlist handed to the renderer itself, so its own player can seek.
+    return _didl(playlist_url, title, "object.item.videoItem", "http-get:*:application/vnd.apple.mpegurl:*")
+
+
+def set_and_play(control_url, url, title, meta=None):
     log("SetAVTransportURI ...")
     soap(control_url, "SetAVTransportURI",
          f"<InstanceID>0</InstanceID><CurrentURI>{html.escape(url)}</CurrentURI>"
-         f"<CurrentURIMetaData>{html.escape(didl(url, title))}</CurrentURIMetaData>")
+         f"<CurrentURIMetaData>{html.escape(meta or didl(url, title))}</CurrentURIMetaData>")
     time.sleep(0.8)
     log("Play ...")
     try:
@@ -6519,29 +6524,55 @@ def run_proxy(args):
     # stream for long; rewritten through ffmpeg on the way, the stream gets a clock and regular
     # tables with the same codecs.
     _remux = _ffmpeg_bin() if any(h in (args.url or "") for h in ("youtube.com", "youtu.be")) else None
-    httpd = ThreadingHTTPServer((ip, args.port), make_handler(target, args.quality, sl_flags, extra_sl, tv=args.tv,
-                                                              remux=_remux or "",
-                                                              vod=getattr(args, "src_vod", False)))
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    log(f"live HTTP server at {local_url} (live-edge={args.live_edge}, quality={args.quality}"
-        + (", remuxed with a clock" if _remux else "") + ")")
-    set_and_play(control_url, local_url, args.title or f"LIVE: {args.url}")
-    log("pushed (live). Ctrl+C stops the server and playback.")
+    _meta = None
+    if args.src_vod and args.src_kind == "hls" and args.media_url:
+        # On-demand HLS: hand the renderer the playlist itself, through the authenticating proxy (the
+        # source's headers ride on every fetch), so its own player has a timeline it can seek in.
+        hdr_map = {}
+        for h in hdrs:
+            if "=" in h:
+                k, v = h.split("=", 1)
+                hdr_map[k] = v
+        try:
+            _fbs = json.loads(args.fallback_media) if args.fallback_media else []
+        except Exception:
+            _fbs = []
+        httpd = ThreadingHTTPServer((ip, args.port),
+                                    make_hls_proxy(args.media_url, hdr_map, tv=args.tv, media_kind="hls",
+                                                   quality="" if args.quality == "best" else args.quality,
+                                                   fallbacks=_fbs))
+        local_url = f"http://{ip}:{args.port}/live.m3u8?vod=1"
+        _meta = didl_hls(local_url, args.title or args.url)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        log(f"hls proxy at {local_url} -> dlna (VOD/seekable)")
+    else:
+        httpd = ThreadingHTTPServer((ip, args.port), make_handler(target, args.quality, sl_flags, extra_sl, tv=args.tv,
+                                                                  remux=_remux or "",
+                                                                  vod=getattr(args, "src_vod", False)))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        log(f"live HTTP server at {local_url} (live-edge={args.live_edge}, quality={args.quality}"
+            + (", remuxed with a clock" if _remux else "") + ")")
+    set_and_play(control_url, local_url, args.title or f"LIVE: {args.url}", meta=_meta)
+    log("pushed (vod playlist)." if _meta else "pushed (live). Ctrl+C stops the server and playback.")
     if not getattr(args, "no_awake", False):
         _held = _keep_awake(f"Casting to {args.tv}")
         log(f"keeping the computer awake ({_held})" if _held
             else "could not ask the system to stay awake; it may sleep during the cast")
     played, gone, retries = False, 0, 0
     DLNA_MAX_RETRIES = 3
+    # A playlist the renderer seeks in itself: a pause or a seek is the viewer's doing, not a dropout,
+    # so it counts as active and only a long silence re-pushes.
+    _active = ("PLAYING", "TRANSITIONING") + (("PAUSED_PLAYBACK",) if _meta else ())
+    _patience = 8 if _meta else 3
     try:
         while True:
             time.sleep(2)
             st = transport_state(control_url)
-            if st in ("PLAYING", "TRANSITIONING"):
+            if st in _active:
                 played, gone, retries = True, 0, 0   # TV is active (playing or buffering)
             elif played:
                 gone += 1                        # not playing after it started
-                if gone >= 3:  # ~6s
+                if gone >= _patience:  # ~6s (~16s for a seekable playlist)
                     if st in ("STOPPED", "NO_MEDIA"):
                         _el = time.monotonic() - _PUSH["since"] if _PUSH["since"] else 0.0
                         log("TV stopped externally; shutting down proxy"    # clean stop -> user stopped
@@ -6555,9 +6586,9 @@ def run_proxy(args):
                         log(f"DLNA: renderer unreachable after {DLNA_MAX_RETRIES} retries; shutting down")
                         break
                     retries += 1; gone = 0
-                    log(f"DLNA: renderer unreachable (re-push retry {retries}/{DLNA_MAX_RETRIES})")
+                    log(f"DLNA: renderer unreachable, state {st[:60]} (re-push retry {retries}/{DLNA_MAX_RETRIES})")
                     try:
-                        set_and_play(control_url, local_url, args.title or f"LIVE: {args.url}")
+                        set_and_play(control_url, local_url, args.title or f"LIVE: {args.url}", meta=_meta)
                     except Exception:
                         pass
     except KeyboardInterrupt:
