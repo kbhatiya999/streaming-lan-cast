@@ -1109,9 +1109,13 @@ _PUSH = {"sent": 0, "media": 0.0, "queued": 0, "since": 0.0}   # the live push's
 
 # --- Live MPEG-TS HTTP server (DLNA push) ------------------------------------
 # Live HTTP server: serves the stream as non-seekable live, fresh per connect.
-def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_ref=None, remux=""):
+def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_ref=None, remux="",
+                 vod=False):
     # remux: path to ffmpeg, when the source's transport stream is to be rewritten on the way
     # through (a stream carrying no PCR clock, which a television's demuxer may not play for long).
+    # vod: the source is on-demand. streamlink then pulls the whole video far faster than real time
+    # and ends, so the reader waits for the client instead of dropping the oldest bytes, and an end
+    # after a full run is the video's end, not a dropout to respawn from (which replays the start).
     # hold_ref, if given, is a 1-element list whose value the adaptive monitor mutates at runtime;
     # the writer reads it each iteration so the hold-delay depth can grow/shrink live. Falls back
     # to the fixed `hold` when absent (e.g. the DLNA path).
@@ -1203,6 +1207,8 @@ def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_r
                             chunk = out.read(188 * 350)
                             if not chunk:
                                 break                     # streamlink ended -> respawn at live edge
+                            while vod and state["reader_bytes"] > MAXQ and not done.is_set():
+                                time.sleep(0.05)          # on-demand: every byte matters, let the client catch up
                             with qlock:
                                 Q.append((time.monotonic(), chunk))
                                 state["reader_bytes"] += len(chunk)
@@ -1265,6 +1271,9 @@ def make_handler(target, quality, sl_flags, extra_sl=(), tv="", hold=0.0, hold_r
                         except Exception:
                             pass
                     if done.is_set():
+                        break
+                    if vod and seg >= 100000:
+                        log(f"proxy: on-demand source delivered in full ({seg // 1024}KB); ending after it plays out")
                         break
                     duds = duds + 1 if seg < 100000 else 0
                     if duds >= 40:            # source dead for a long stretch -> stop
@@ -6485,7 +6494,8 @@ def run_proxy(args):
     # tables with the same codecs.
     _remux = _ffmpeg_bin() if any(h in (args.url or "") for h in ("youtube.com", "youtu.be")) else None
     httpd = ThreadingHTTPServer((ip, args.port), make_handler(target, args.quality, sl_flags, extra_sl, tv=args.tv,
-                                                              remux=_remux or ""))
+                                                              remux=_remux or "",
+                                                              vod=getattr(args, "src_vod", False)))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     log(f"live HTTP server at {local_url} (live-edge={args.live_edge}, quality={args.quality}"
         + (", remuxed with a clock" if _remux else "") + ")")
